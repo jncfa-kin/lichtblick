@@ -33,6 +33,7 @@ function makeElectronBuilderConfig(params) {
       },
     ],
     linux: {
+      syncDesktopName: true,
       target: [
         {
           target: "deb",

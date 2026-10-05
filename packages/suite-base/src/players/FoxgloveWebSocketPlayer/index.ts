@@ -62,6 +62,12 @@ import rosDatatypesToMessageDefinition from "@lichtblick/suite-base/util/rosData
 
 import { JsonMessageWriter } from "./JsonMessageWriter";
 import WorkerSocketAdapter from "./WorkerSocketAdapter";
+import PlaybackWebSocketAdapter, {
+  PLAYBACK_CONTROL_CAPABILITY,
+  PlaybackCommand,
+  PlaybackState,
+  PlaybackStatus,
+} from "./PlaybackWebSocketAdapter";
 import {
   CURRENT_FRAME_MAXIMUM_SIZE_BYTES,
   FALLBACK_PUBLICATION_ENCODING,
@@ -119,6 +125,9 @@ export default class FoxgloveWebSocketPlayer implements Player {
   #clockTime?: Time;
   /* Flag indicating if the server publishes time messages */
   #serverPublishesTime = false;
+  #playbackSocket?: PlaybackWebSocketAdapter;
+  #isPlaying = true;
+  #playbackSpeed = 1;
 
   #unresolvedSubscriptions = new Set<string>();
   #resolvedSubscriptionsByTopic = new Map<string, SubscriptionId>();
@@ -189,12 +198,12 @@ export default class FoxgloveWebSocketPlayer implements Player {
 
     const subprotocols = [FoxgloveClient.SUPPORTED_SUBPROTOCOL, "foxglove.sdk.v1"];
 
-    this.#client = new FoxgloveClient({
-      ws:
-        typeof Worker !== "undefined"
-          ? new WorkerSocketAdapter(this.#url, subprotocols)
-          : (new WebSocket(this.#url, subprotocols) as IWebSocket),
-    });
+    const webSocket =
+      typeof Worker !== "undefined"
+        ? new WorkerSocketAdapter(this.#url, subprotocols)
+        : (new WebSocket(this.#url, subprotocols) as IWebSocket);
+    this.#playbackSocket = new PlaybackWebSocketAdapter(webSocket, this.#handlePlaybackState);
+    this.#client = new FoxgloveClient({ ws: this.#playbackSocket });
 
     this.#client.on("open", () => {
       if (this.#closed) {
@@ -295,12 +304,34 @@ export default class FoxgloveWebSocketPlayer implements Player {
       this.#name = `${this.#url}\n${event.name}`;
       this.#serverCapabilities = Array.isArray(event.capabilities) ? event.capabilities : [];
       this.#serverPublishesTime = this.#serverCapabilities.includes(ServerCapability.time);
+      if (this.#serverCapabilities.includes(PLAYBACK_CONTROL_CAPABILITY)) {
+        this.#playerCapabilities = this.#playerCapabilities.concat(
+          PLAYER_CAPABILITIES.playbackControl,
+          PLAYER_CAPABILITIES.setSpeed,
+        );
+        this.#isPlaying = false;
+        const playbackInfo = event as typeof event & {
+          dataStartTime?: { sec: number; nsec: number };
+          dataEndTime?: { sec: number; nsec: number };
+        };
+        if (playbackInfo.dataStartTime && playbackInfo.dataEndTime) {
+          this.#startTime = fromNanoSec(
+            BigInt(playbackInfo.dataStartTime.sec) * 1_000_000_000n +
+              BigInt(playbackInfo.dataStartTime.nsec),
+          );
+          this.#endTime = fromNanoSec(
+            BigInt(playbackInfo.dataEndTime.sec) * 1_000_000_000n +
+              BigInt(playbackInfo.dataEndTime.nsec),
+          );
+          this.#clockTime = this.#startTime;
+        }
+      }
       this.#supportedEncodings = event.supportedEncodings;
       this.#datatypes = new Map();
 
       // If the server publishes the time we clear any existing clockTime we might have and let the
       // server override
-      if (this.#serverPublishesTime) {
+      if (this.#serverPublishesTime && !this.#serverCapabilities.includes(PLAYBACK_CONTROL_CAPABILITY)) {
         this.#clockTime = undefined;
       }
 
@@ -935,8 +966,8 @@ export default class FoxgloveWebSocketPlayer implements Player {
         startTime: this.#startTime,
         endTime: this.#endTime,
         currentTime,
-        isPlaying: true,
-        speed: 1,
+        isPlaying: this.#isPlaying,
+        speed: this.#playbackSpeed,
         lastSeekTime: this.#numTimeSeeks,
         topics: this.#topics,
         topicStats: this.#topicsStats,
@@ -948,6 +979,19 @@ export default class FoxgloveWebSocketPlayer implements Player {
       },
     });
   });
+
+  #handlePlaybackState = (state: PlaybackState): void => {
+    const time = fromNanoSec(state.currentTime);
+    if (state.didSeek || (this.#clockTime != undefined && isLessThan(time, this.#clockTime))) {
+      this.#numTimeSeeks++;
+      this.#parsedMessages = [];
+      this.#parsedMessagesBytes = 0;
+    }
+    this.#clockTime = time;
+    this.#isPlaying = state.status === PlaybackStatus.Playing;
+    this.#playbackSpeed = state.playbackSpeed;
+    this.#emitState();
+  };
 
   public setListener(listener: (arg0: PlayerState) => Promise<void>): void {
     this.#listener = listener;
@@ -1215,6 +1259,40 @@ export default class FoxgloveWebSocketPlayer implements Player {
 
   public setGlobalVariables(): void {}
 
+  public startPlayback(): void {
+    this.#sendPlaybackControl(PlaybackCommand.Play);
+  }
+
+  public pausePlayback(): void {
+    this.#sendPlaybackControl(PlaybackCommand.Pause);
+  }
+
+  public seekPlayback(time: Time): void {
+    this.#sendPlaybackControl(
+      this.#isPlaying ? PlaybackCommand.Play : PlaybackCommand.Pause,
+      BigInt(time.sec) * 1_000_000_000n + BigInt(time.nsec),
+    );
+  }
+
+  public setPlaybackSpeed(speedFraction: number): void {
+    this.#sendPlaybackControl(
+      this.#isPlaying ? PlaybackCommand.Play : PlaybackCommand.Pause,
+      undefined,
+      speedFraction,
+    );
+  }
+
+  #sendPlaybackControl(
+    command: PlaybackCommand,
+    seekTime?: bigint,
+    speed = this.#playbackSpeed,
+  ): void {
+    if (!this.#playbackSocket) {
+      return;
+    }
+    this.#playbackSocket.sendPlaybackControlRequest(command, speed, seekTime);
+  }
+
   public getBatchIterator(): undefined {
     // FoxgloveWebSocketPlayer does not support batch iteration
     return undefined;
@@ -1337,6 +1415,8 @@ export default class FoxgloveWebSocketPlayer implements Player {
     this.#startTime = undefined;
     this.#endTime = undefined;
     this.#clockTime = undefined;
+    this.#isPlaying = true;
+    this.#playbackSpeed = 1;
     this.#topicsStats = new Map();
     this.#parsedMessages = [];
     this.#receivedBytes = 0;

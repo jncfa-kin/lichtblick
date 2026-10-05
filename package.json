@@ -19,6 +19,7 @@
   "engines": {
     "node": ">=20"
   },
+  "desktopName": "com.lichtblick.Lichtblick",
   "scripts": {
     "clean": "bash ci/clean-build.sh",
     "build:packages": "tsc --build --verbose packages/*/tsconfig.json packages/*/src/*/tsconfig.json",
